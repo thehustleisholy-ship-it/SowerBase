@@ -117,7 +117,7 @@ while (-not $shutdown) {
         $requestCount++
 
         # Log request
-        Write-Log "Request #$requestCount: $($request.HttpMethod) $($request.RawUrl)" "DEBUG"
+        Write-Log "Request #${requestCount}: $($request.HttpMethod) $($request.RawUrl)" "DEBUG"
 
         # Validate method
         if ($request.HttpMethod -ne "POST") {
@@ -271,8 +271,6 @@ RETURNING id;
             # This would be the production implementation
             # For now, using fallback backend approach above
         }
-
-        $response.Close()
 
         $response.Close()
 
