@@ -97,14 +97,13 @@ while (-not $shutdown) {
 
     try {
         # Wait for incoming request (with timeout)
-        $asyncResult = $listener.BeginGetContext([System.AsyncCallback]{}, $null)
-        $asyncResult.AsyncWaitHandle.WaitOne(1000) | Out-Null
-
-        if (-not $asyncResult.IsCompleted) {
+        # Use blocking GetContext instead of async to avoid runspace issues
+        if ($listener.IsListening) {
+            $context = $listener.GetContext()
+        } else {
+            Start-Sleep -Milliseconds 100
             continue
         }
-
-        $context = $listener.EndGetContext($asyncResult)
         $request = $context.Request
         $response = $context.Response
 
