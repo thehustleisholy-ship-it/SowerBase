@@ -22,11 +22,16 @@
     Run all safety checks without creating backup artifacts (default: $false)
     No backups are created, no passwords required, all verifications performed
 
+.PARAMETER AllowPartial
+    Allow backup to proceed even if one component fails (default: $false)
+    When false (default), all-mode backup fails before creating any artifacts if preflight fails
+
 .EXAMPLE
     .\thih-backup-sowerbase.ps1 -BackupType all
     .\thih-backup-sowerbase.ps1 -BackupType postgresql
     .\thih-backup-sowerbase.ps1 -BackupType nocodb -InitDirectories $false
     .\thih-backup-sowerbase.ps1 -ValidateOnly
+    $env:SOWERBASE_DB_PASSWORD = "your-password"; .\thih-backup-sowerbase.ps1 -BackupType all
 
 .NOTES
     Status: Review Ready
@@ -48,7 +53,9 @@ param(
 
     [bool]$InitDirectories = $true,
 
-    [switch]$ValidateOnly
+    [switch]$ValidateOnly,
+
+    [switch]$AllowPartial
 )
 
 # ============================================================================
@@ -271,6 +278,99 @@ function Test-BackupDirectoriesCreatable {
     }
 }
 
+function Get-DatabasePassword {
+    # Preferred source order:
+    # 1. Environment variable SOWERBASE_DB_PASSWORD
+    # 2. Interactive prompt (if not in non-interactive mode)
+    # 3. Fail
+
+    if ($env:SOWERBASE_DB_PASSWORD) {
+        Write-Log "Using password from SOWERBASE_DB_PASSWORD environment variable" "DEBUG"
+        return $env:SOWERBASE_DB_PASSWORD
+    }
+
+    # Check if we're in interactive mode
+    if ([System.Environment]::UserInteractive -and [Console]::In -ne $null) {
+        try {
+            $securePassword = Read-Host -AsSecureString "Enter PostgreSQL password (or press Ctrl+C to skip)"
+            $plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToCoTaskMemUnicode($securePassword))
+            return $plainPassword
+        } catch {
+            Write-Log "Interactive password input failed: $_" "ERROR"
+            return $null
+        }
+    }
+
+    Write-Log "No password available: SOWERBASE_DB_PASSWORD not set and interactive mode unavailable" "ERROR"
+    return $null
+}
+
+function Test-PostgreSQLCredentials {
+    param([string]$DbPassword)
+
+    if (-not $DbPassword) {
+        Write-Log "PostgreSQL credentials preflight FAILED: No password provided" "ERROR"
+        return $false
+    }
+
+    if (-not (Test-ContainerRunning $DOCKER_CONTAINER_NAME)) {
+        Write-Log "PostgreSQL credentials preflight FAILED: Database container not running" "ERROR"
+        return $false
+    }
+
+    try {
+        Write-Log "Verifying PostgreSQL credentials..." "DEBUG"
+        $env:PGPASSWORD = $DbPassword
+        $testConnection = docker exec -T $DOCKER_CONTAINER_NAME psql -U $DB_USER -h localhost -d postgres -c "SELECT 1;" 2>&1
+
+        if ($LASTEXITCODE -eq 0) {
+            Write-Log "PostgreSQL credentials verified" "SUCCESS"
+            Remove-Item -ErrorAction SilentlyContinue env:PGPASSWORD
+            return $true
+        } else {
+            Write-Log "PostgreSQL credentials verification failed: Connection test failed" "ERROR"
+            Remove-Item -ErrorAction SilentlyContinue env:PGPASSWORD
+            return $false
+        }
+    } catch {
+        Write-Log "PostgreSQL credentials test exception: $_" "ERROR"
+        Remove-Item -ErrorAction SilentlyContinue env:PGPASSWORD
+        return $false
+    }
+}
+
+function Test-ArchiveContents {
+    param([string]$ArchivePath)
+
+    if (-not (Test-Path $ArchivePath)) {
+        Write-Log "Archive contents check: File not found: $ArchivePath" "ERROR"
+        return $false
+    }
+
+    $fileSize = (Get-Item $ArchivePath).Length
+
+    if ($fileSize -lt 1KB) {
+        Write-Log "WARNING: Archive is very small ($fileSize bytes). This may indicate an empty volume backup." "WARN"
+        Write-Log "Note: PostgreSQL is the primary data backup; NocoDB volume contains configuration only." "INFO"
+    }
+
+    try {
+        Write-Log "Verifying archive contents..." "DEBUG"
+        $contents = docker run --rm -v "$($BACKUP_DIRS.volumes):/backup" busybox tar tzf "/backup/$(Split-Path -Leaf $ArchivePath)" 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $fileCount = @($contents | Where-Object { $_ -and $_ -notmatch '^/$' }).Count
+            Write-Log "Archive contains $fileCount items" "DEBUG"
+            return $true
+        } else {
+            Write-Log "Archive contents verification failed" "ERROR"
+            return $false
+        }
+    } catch {
+        Write-Log "Archive verification exception: $_" "ERROR"
+        return $false
+    }
+}
+
 function Get-FileSize {
     param([string]$FilePath)
     if (Test-Path $FilePath) {
@@ -299,21 +399,28 @@ function Backup-PostgreSQL {
 
     # Validate prerequisites
     if (-not (Test-DockerAvailable)) {
-        Write-Log "PostgreSQL backup skipped - Docker unavailable" "ERROR"
-        Add-Content -Path $BACKUP_LOG -Value "[$(Get-Date)] POSTGRES_BACKUP_SKIPPED Docker unavailable"
+        Write-Log "PostgreSQL backup FAILED - Docker unavailable" "ERROR"
+        Add-Content -Path $BACKUP_LOG -Value "[$(Get-Date)] POSTGRES_BACKUP_FAILED Docker unavailable"
         return $false
     }
 
     if (-not (Test-ContainerRunning $DOCKER_CONTAINER_NAME)) {
-        Write-Log "PostgreSQL backup skipped - database container not running" "ERROR"
-        Add-Content -Path $BACKUP_LOG -Value "[$(Get-Date)] POSTGRES_BACKUP_SKIPPED Container not running"
+        Write-Log "PostgreSQL backup FAILED - database container not running" "ERROR"
+        Add-Content -Path $BACKUP_LOG -Value "[$(Get-Date)] POSTGRES_BACKUP_FAILED Container not running"
         return $false
     }
 
     if (-not $DbPassword) {
-        Write-Log "PostgreSQL backup skipped - password not provided" "ERROR"
-        Write-Host "Usage: Provide password via -DbPassword parameter"
-        Write-Host "Example: .\thih-backup-sowerbase.ps1 -BackupType postgresql -DbPassword `"`$env:DB_PASSWORD`""
+        Write-Log "PostgreSQL backup FAILED - no password available" "ERROR"
+        Write-Log "Set SOWERBASE_DB_PASSWORD environment variable or run in interactive mode" "ERROR"
+        Add-Content -Path $BACKUP_LOG -Value "[$(Get-Date)] POSTGRES_BACKUP_FAILED No password available"
+        return $false
+    }
+
+    # Credentials preflight
+    if (-not (Test-PostgreSQLCredentials $DbPassword)) {
+        Write-Log "PostgreSQL backup FAILED - credentials preflight check failed" "ERROR"
+        Add-Content -Path $BACKUP_LOG -Value "[$(Get-Date)] POSTGRES_BACKUP_FAILED Credential verification failed"
         return $false
     }
 
@@ -410,6 +517,10 @@ function Backup-NocoDB {
             Write-Log "NocoDB volume backup completed successfully" "SUCCESS"
             Write-Log "  File: $backupFile" "INFO"
             Write-Log "  Size: $fileSize" "INFO"
+
+            # Sanity check archive contents
+            Test-ArchiveContents $backupFile | Out-Null
+
             Add-Content -Path $BACKUP_LOG -Value "[$(Get-Date)] NOCODB_BACKUP_SUCCESS $backupFile ($fileSize)"
             return $true
         }
@@ -586,19 +697,14 @@ $nocodbSuccess = $false
 # Determine which backups to run
 switch ($BackupType) {
     "postgresql" {
-        # Prompt for password (required for database backup)
-        Write-Host ""
-        Write-Host "PostgreSQL password is required for backup."
-        Write-Host "Options:"
-        Write-Host "  1. Get from Windows Credential Manager"
-        Write-Host "  2. Use environment variable"
-        Write-Host ""
-        $dbPassword = Read-Host -AsSecureString "Enter PostgreSQL password (or press Ctrl+C to skip)"
+        # Get password from environment or interactive prompt
+        $dbPassword = Get-DatabasePassword
         if ($dbPassword) {
-            $plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToCoTaskMemUnicode($dbPassword))
-            $postgresSuccess = Backup-PostgreSQL -DbPassword $plainPassword
-            Remove-Variable plainPassword
+            $postgresSuccess = Backup-PostgreSQL -DbPassword $dbPassword
             Remove-Variable dbPassword
+        } else {
+            Write-Log "PostgreSQL backup aborted - no password available" "ERROR"
+            Add-Content -Path $BACKUP_LOG -Value "[$(Get-Date)] POSTGRES_BACKUP_ABORTED No password"
         }
     }
 
@@ -607,22 +713,36 @@ switch ($BackupType) {
     }
 
     "all" {
-        # PostgreSQL backup (requires password)
-        Write-Host ""
-        Write-Host "PostgreSQL password is required for backup."
-        Write-Host "Options:"
-        Write-Host "  1. Get from Windows Credential Manager"
-        Write-Host "  2. Use environment variable"
-        Write-Host ""
-        $dbPassword = Read-Host -AsSecureString "Enter PostgreSQL password (or press Ctrl+C to skip)"
-        if ($dbPassword) {
-            $plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToCoTaskMemUnicode($dbPassword))
-            $postgresSuccess = Backup-PostgreSQL -DbPassword $plainPassword
-            Remove-Variable plainPassword
-            Remove-Variable dbPassword
+        # Credential preflight for all-mode to prevent partial backups
+        Write-Log "Running credential preflight for all-mode backup" "INFO"
+
+        $dbPassword = Get-DatabasePassword
+        if (-not $dbPassword) {
+            Write-Log "Backup ABORTED - Credential preflight failed (no password)" "ERROR"
+            Write-Log "No backup artifacts were created. Set SOWERBASE_DB_PASSWORD to proceed." "ERROR"
+            Add-Content -Path $BACKUP_LOG -Value "[$(Get-Date)] BACKUP_ABORTED Credential preflight failed"
+            exit 1
         }
 
-        # NocoDB backup (no password needed)
+        if (-not (Test-PostgreSQLCredentials $dbPassword)) {
+            if ($AllowPartial) {
+                Write-Log "PostgreSQL credential check failed, but -AllowPartial is enabled" "WARN"
+                Write-Log "Proceeding with partial backup (NocoDB only)" "WARN"
+                Add-Content -Path $BACKUP_LOG -Value "[$(Get-Date)] PARTIAL_BACKUP_WARNING PostgreSQL failed, NocoDB-only backup"
+            } else {
+                Write-Log "Backup ABORTED - PostgreSQL credential preflight failed" "ERROR"
+                Write-Log "No backup artifacts were created. Verify SOWERBASE_DB_PASSWORD and database connectivity." "ERROR"
+                Write-Log "Use -AllowPartial to allow NocoDB-only backups if PostgreSQL fails." "INFO"
+                Add-Content -Path $BACKUP_LOG -Value "[$(Get-Date)] BACKUP_ABORTED PostgreSQL credential preflight failed"
+                exit 1
+            }
+        }
+
+        # Both preflight passed (or partial allowed), proceed with backups
+        $postgresSuccess = Backup-PostgreSQL -DbPassword $dbPassword
+        Remove-Variable dbPassword
+
+        # NocoDB backup
         $nocodbSuccess = Backup-NocoDB
     }
 }
