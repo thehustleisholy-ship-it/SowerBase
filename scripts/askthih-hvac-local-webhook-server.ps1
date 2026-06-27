@@ -44,32 +44,22 @@ Write-Log "Endpoint: http://localhost:$Port/askthih/hvac"
 
 Write-Log "Checking prerequisites..."
 
-# Check PostgreSQL access
-$env:PGPASSWORD = $env:SOWERBASE_DB_PASSWORD
-if (-not $env:PGPASSWORD) {
-    Write-Log "ERROR: SOWERBASE_DB_PASSWORD environment variable not set" "ERROR"
-    exit 1
+# Verify SowerBase API environment variables
+$requiredVars = @(
+    "SOWERBASE_BASE_URL",
+    "SOWERBASE_API_TOKEN",
+    "SOWERBASE_INTAKE_TABLE_ID"
+)
+
+foreach ($var in $requiredVars) {
+    if (-not (Get-Item -Path "env:$var" -ErrorAction SilentlyContinue)) {
+        Write-Log "ERROR: $var environment variable not set" "ERROR"
+        exit 1
+    }
 }
 
-# Verify PostgreSQL
-$pgTest = docker exec sowerbase-local-db-1 psql -U nocodb -d nocodb -t -c "SELECT 1;" 2>&1
-if ($pgTest -notmatch "1") {
-    Write-Log "ERROR: Cannot reach PostgreSQL" "ERROR"
-    exit 1
-}
-
-Write-Log "PostgreSQL is accessible"
-
-# Verify Intake Submissions table
-$tableExists = docker exec sowerbase-local-db-1 psql -U nocodb -d nocodb -t -c "SELECT 1 FROM information_schema.tables WHERE table_name='Intake Submissions';" 2>&1
-if ($tableExists -notmatch "1") {
-    Write-Log "ERROR: Intake Submissions table not found" "ERROR"
-    exit 1
-}
-
-Write-Log "Intake Submissions table verified"
-
-[System.Environment]::SetEnvironmentVariable('PGPASSWORD', $null)
+Write-Log "SowerBase API environment variables verified"
+Write-Log "SOWERBASE_BASE_URL configured (token redacted)" "DEBUG"
 
 # ============================================================================
 # HTTP Listener Setup
@@ -196,54 +186,52 @@ while (-not $shutdown) {
             ) | ConvertTo-Json)
         }
 
-        # Get API token (from environment or fallback)
+        # ====================================================================
+        # Call SowerBase/NocoDB API (API-Safe Pattern Only)
+        # ====================================================================
+
+        Write-Log "Creating intake record via SowerBase/NocoDB API..." "INFO"
+
         $apiToken = $env:SOWERBASE_API_TOKEN
         if (-not $apiToken) {
-            Write-Log "WARNING: SOWERBASE_API_TOKEN not set, using fallback approach" "WARN"
-            # Fallback: use PostgreSQL backend for local testing
-            # In production, API token would be required
-            $env:PGPASSWORD = $env:SOWERBASE_DB_PASSWORD
+            Write-Log "ERROR: SOWERBASE_API_TOKEN required (no fallback available)" "ERROR"
+            $response.StatusCode = 500
+            $response.Close()
+            continue
+        }
 
-            # Build SQL INSERT via proper backend layer
-            $sql = @"
-INSERT INTO public."Intake Submissions" (
-    "Submission Title", "Vertical", "Contact Name", "Phone", "Email",
-    "Service Address", "Problem Description", "Urgency", "Channel", "Status",
-    "Source System", "Source Base ID", "Source Table Name", "Migration Status",
-    "Raw Payload", "Submitted At"
-) VALUES (
-    '$($payload.submission_title -replace "'", "''")' ,
-    '$($payload.vertical)' ,
-    '$($payload.contact_name -replace "'", "''")' ,
-    '$($payload.phone)' ,
-    '$($payload.email)' ,
-    '$($payload.service_address -replace "'", "''")' ,
-    '$($payload.problem_description -replace "'", "''")' ,
-    '$($payload.urgency)' ,
-    '$($payload.channel)' ,
-    '$($payload.status)' ,
-    '$(if ($payload.source_system) { $payload.source_system } else { "askthih_api_safe_webhook" })' ,
-    'app60wQWdbbgyqTcL' ,
-    '$(if ($payload.source_table_name) { $payload.source_table_name } else { "HVAC Intake" })' ,
-    '$(if ($payload.migration_status) { $payload.migration_status } else { "webhook" })' ,
-    '$($apiPayload."Raw Payload" -replace "'", "''")' ,
-    NOW()
-)
-RETURNING id;
-"@
+        # Construct NocoDB API endpoint
+        $baseUrl = $env:SOWERBASE_BASE_URL
+        $tableId = $env:SOWERBASE_INTAKE_TABLE_ID
+        $apiUrl = "$baseUrl/api/v2/tables/$tableId/records"
 
-            $insertResult = $sql | docker exec -i sowerbase-local-db-1 psql -U nocodb -d nocodb 2>&1
+        Write-Log "API endpoint: [redacted for security]" "DEBUG"
 
-            if ($insertResult -match "INSERT") {
-                Write-Log "SUCCESS: Record created via SowerBase backend" "SUCCESS"
-                $recordId = ($insertResult -split "\n" | Where-Object { $_ -match "^\s*\d+\s*$" } | Select-Object -First 1).Trim()
+        # Call SowerBase API to create record
+        try {
+            $response_api = Invoke-WebRequest -Uri $apiUrl `
+                -Method POST `
+                -Headers @{
+                    "Authorization" = "Bearer $apiToken"
+                    "Content-Type" = "application/json"
+                    "xc-auth" = $apiToken
+                } `
+                -Body ($apiPayload | ConvertTo-Json) `
+                -ErrorAction Stop
+
+            if ($response_api.StatusCode -eq 200 -or $response_api.StatusCode -eq 201) {
+                Write-Log "SUCCESS: Record created via SowerBase/NocoDB API" "SUCCESS"
+
+                $responseData = $response_api.Content | ConvertFrom-Json
+                $recordId = $responseData.id
+
                 Write-Log "Record ID: $recordId" "SUCCESS"
 
                 $responseBody = @{
                     status = "success"
                     message = "HVAC intake received and stored"
                     record_id = $recordId
-                    method = "sowerbase-backend-api"
+                    method = "sowerbase-api"
                 } | ConvertTo-Json
 
                 $response.StatusCode = 201
@@ -252,24 +240,18 @@ RETURNING id;
                 $response.ContentLength64 = $bytes.Length
                 $response.OutputStream.Write($bytes, 0, $bytes.Length)
 
-                Write-Log "Response: 201 Created (backend API)"
+                Write-Log "Response: 201 Created (SowerBase API)"
             } else {
-                Write-Log "ERROR: Backend API request failed" "ERROR"
+                Write-Log "ERROR: Unexpected response from SowerBase API: $($response_api.StatusCode)" "ERROR"
                 $response.StatusCode = 500
                 $response.Close()
                 continue
             }
-
-            [System.Environment]::SetEnvironmentVariable('PGPASSWORD', $null)
-        } else {
-            # Production path: use NocoDB API with token
-            Write-Log "Using SowerBase/NocoDB API with authentication" "INFO"
-
-            $apiUrl = "$($env:SOWERBASE_BASE_URL -replace 'http://', 'http://api.')/api/v2/db/data/noco/nocodb"
-            Write-Log "API endpoint configured (token redacted)" "DEBUG"
-
-            # This would be the production implementation
-            # For now, using fallback backend approach above
+        } catch {
+            Write-Log "ERROR: SowerBase API request failed: $($_.Exception.Message)" "ERROR"
+            $response.StatusCode = 500
+            $response.Close()
+            continue
         }
 
         $response.Close()
