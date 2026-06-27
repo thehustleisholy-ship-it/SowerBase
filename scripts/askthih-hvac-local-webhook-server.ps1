@@ -91,6 +91,10 @@ $shutdown = $false
 $null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action { $shutdown = $true }
 
 while (-not $shutdown) {
+    $context = $null
+    $request = $null
+    $response = $null
+
     try {
         # Wait for incoming request (with timeout)
         $asyncResult = $listener.BeginGetContext([System.AsyncCallback]{}, $null)
@@ -109,35 +113,116 @@ while (-not $shutdown) {
         # Log request
         Write-Log "Request #${requestCount}: $($request.HttpMethod) $($request.RawUrl)" "DEBUG"
 
-        # Validate method
-        if ($request.HttpMethod -ne "POST") {
-            Write-Log "Rejected non-POST request" "DEBUG"
+        # ====================================================================
+        # Handle non-POST requests safely (HEAD, GET, OPTIONS, etc.)
+        # ====================================================================
+
+        if ($request.HttpMethod -eq "HEAD") {
+            Write-Log "HEAD request to $($request.RawUrl) - returning 405" "DEBUG"
             $response.StatusCode = 405
             $response.Close()
             continue
         }
 
-        # Validate path
-        if ($request.RawUrl -ne "/askthih/hvac") {
-            Write-Log "Rejected unknown path: $($request.RawUrl)" "DEBUG"
-            $response.StatusCode = 404
+        if ($request.HttpMethod -eq "OPTIONS") {
+            Write-Log "OPTIONS preflight request to $($request.RawUrl)" "DEBUG"
+            $response.StatusCode = 405
+            $response.Headers.Add("Allow", "POST")
             $response.Close()
             continue
         }
 
-        # Read request body
-        $reader = New-Object System.IO.StreamReader($request.InputStream)
-        $body = $reader.ReadToEnd()
-        $reader.Close()
+        if ($request.HttpMethod -eq "GET") {
+            Write-Log "GET request to $($request.RawUrl) - returning 405" "DEBUG"
+            $response.StatusCode = 405
+            $response.Headers.Add("Content-Type", "application/json")
+            $responseBody = @{
+                status = "error"
+                message = "Method not allowed. Use POST."
+            } | ConvertTo-Json
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($responseBody)
+            $response.ContentLength64 = $bytes.Length
+            $response.OutputStream.Write($bytes, 0, $bytes.Length)
+            $response.Close()
+            continue
+        }
+
+        # ====================================================================
+        # Validate path before processing POST
+        # ====================================================================
+
+        if ($request.RawUrl -ne "/askthih/hvac") {
+            Write-Log "Rejected unknown path: $($request.RawUrl)" "DEBUG"
+            $response.StatusCode = 404
+            $response.Headers.Add("Content-Type", "application/json")
+            $responseBody = @{
+                status = "error"
+                message = "Endpoint not found"
+            } | ConvertTo-Json
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($responseBody)
+            $response.ContentLength64 = $bytes.Length
+            $response.OutputStream.Write($bytes, 0, $bytes.Length)
+            $response.Close()
+            continue
+        }
+
+        # ====================================================================
+        # Only POST to /askthih/hvac is processed
+        # ====================================================================
+
+        if ($request.HttpMethod -ne "POST") {
+            Write-Log "Rejected non-POST request: $($request.HttpMethod)" "DEBUG"
+            $response.StatusCode = 405
+            $response.Headers.Add("Content-Type", "application/json")
+            $responseBody = @{
+                status = "error"
+                message = "Method not allowed. Use POST."
+            } | ConvertTo-Json
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($responseBody)
+            $response.ContentLength64 = $bytes.Length
+            $response.OutputStream.Write($bytes, 0, $bytes.Length)
+            $response.Close()
+            continue
+        }
+
+        # Read request body safely
+        $body = ""
+        try {
+            $reader = New-Object System.IO.StreamReader($request.InputStream)
+            $body = $reader.ReadToEnd()
+            $reader.Dispose()
+        } catch {
+            Write-Log "ERROR: Failed to read request body: $($_.Exception.Message)" "ERROR"
+            $response.StatusCode = 400
+            $response.Headers.Add("Content-Type", "application/json")
+            $responseBody = @{
+                status = "error"
+                message = "Failed to read request body"
+            } | ConvertTo-Json
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($responseBody)
+            $response.ContentLength64 = $bytes.Length
+            $response.OutputStream.Write($bytes, 0, $bytes.Length)
+            $response.Close()
+            continue
+        }
 
         Write-Log "Request body length: $($body.Length) bytes" "DEBUG"
 
         # Parse JSON
+        $payload = $null
         try {
-            $payload = $body | ConvertFrom-Json
+            $payload = $body | ConvertFrom-Json -ErrorAction Stop
         } catch {
             Write-Log "ERROR: Invalid JSON payload" "ERROR"
             $response.StatusCode = 400
+            $response.Headers.Add("Content-Type", "application/json")
+            $responseBody = @{
+                status = "error"
+                message = "Invalid JSON payload"
+            } | ConvertTo-Json
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($responseBody)
+            $response.ContentLength64 = $bytes.Length
+            $response.OutputStream.Write($bytes, 0, $bytes.Length)
             $response.Close()
             continue
         }
@@ -152,6 +237,14 @@ while (-not $shutdown) {
         if ($missingFields.Count -gt 0) {
             Write-Log "ERROR: Missing required fields: $($missingFields -join ', ')" "ERROR"
             $response.StatusCode = 400
+            $response.Headers.Add("Content-Type", "application/json")
+            $responseBody = @{
+                status = "error"
+                message = "Missing required fields: $($missingFields -join ', ')"
+            } | ConvertTo-Json
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($responseBody)
+            $response.ContentLength64 = $bytes.Length
+            $response.OutputStream.Write($bytes, 0, $bytes.Length)
             $response.Close()
             continue
         }
@@ -159,10 +252,8 @@ while (-not $shutdown) {
         Write-Log "Payload validation passed"
 
         # ====================================================================
-        # Insert Record Through SowerBase/NocoDB API
+        # Prepare SowerBase API payload
         # ====================================================================
-
-        Write-Log "Creating intake record via SowerBase/NocoDB API..."
 
         # Prepare API request payload
         $apiPayload = @{
@@ -196,6 +287,14 @@ while (-not $shutdown) {
         if (-not $apiToken) {
             Write-Log "ERROR: SOWERBASE_API_TOKEN required (no fallback available)" "ERROR"
             $response.StatusCode = 500
+            $response.Headers.Add("Content-Type", "application/json")
+            $responseBody = @{
+                status = "error"
+                message = "Server configuration error"
+            } | ConvertTo-Json
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($responseBody)
+            $response.ContentLength64 = $bytes.Length
+            $response.OutputStream.Write($bytes, 0, $bytes.Length)
             $response.Close()
             continue
         }
@@ -244,12 +343,28 @@ while (-not $shutdown) {
             } else {
                 Write-Log "ERROR: Unexpected response from SowerBase API: $($response_api.StatusCode)" "ERROR"
                 $response.StatusCode = 500
+                $response.Headers.Add("Content-Type", "application/json")
+                $responseBody = @{
+                    status = "error"
+                    message = "SowerBase API error"
+                } | ConvertTo-Json
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes($responseBody)
+                $response.ContentLength64 = $bytes.Length
+                $response.OutputStream.Write($bytes, 0, $bytes.Length)
                 $response.Close()
                 continue
             }
         } catch {
             Write-Log "ERROR: SowerBase API request failed: $($_.Exception.Message)" "ERROR"
             $response.StatusCode = 500
+            $response.Headers.Add("Content-Type", "application/json")
+            $responseBody = @{
+                status = "error"
+                message = "Failed to create record"
+            } | ConvertTo-Json
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($responseBody)
+            $response.ContentLength64 = $bytes.Length
+            $response.OutputStream.Write($bytes, 0, $bytes.Length)
             $response.Close()
             continue
         }
@@ -257,7 +372,27 @@ while (-not $shutdown) {
         $response.Close()
 
     } catch {
-        Write-Log "ERROR: Request handler exception: $_" "ERROR"
+        Write-Log "ERROR: Request handler exception: $($_.Exception.Message)" "ERROR"
+        try {
+            if ($response) {
+                if (-not $response.OutputStream.CanWrite) {
+                    $response.Close()
+                } else {
+                    $response.StatusCode = 500
+                    $response.Headers.Add("Content-Type", "application/json")
+                    $responseBody = @{
+                        status = "error"
+                        message = "Internal server error"
+                    } | ConvertTo-Json
+                    $bytes = [System.Text.Encoding]::UTF8.GetBytes($responseBody)
+                    $response.ContentLength64 = $bytes.Length
+                    $response.OutputStream.Write($bytes, 0, $bytes.Length)
+                    $response.Close()
+                }
+            }
+        } catch {
+            Write-Log "ERROR: Failed to close response: $($_.Exception.Message)" "ERROR"
+        }
     }
 }
 
