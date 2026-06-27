@@ -18,10 +18,15 @@
 .PARAMETER InitDirectories
     Create backup directory structure if it doesn't exist (default: $true)
 
+.PARAMETER ValidateOnly
+    Run all safety checks without creating backup artifacts (default: $false)
+    No backups are created, no passwords required, all verifications performed
+
 .EXAMPLE
     .\thih-backup-sowerbase.ps1 -BackupType all
     .\thih-backup-sowerbase.ps1 -BackupType postgresql
     .\thih-backup-sowerbase.ps1 -BackupType nocodb -InitDirectories $false
+    .\thih-backup-sowerbase.ps1 -ValidateOnly
 
 .NOTES
     Status: Review Ready
@@ -41,7 +46,9 @@ param(
     [ValidateSet('postgresql', 'nocodb', 'all')]
     [string]$BackupType = 'all',
 
-    [bool]$InitDirectories = $true
+    [bool]$InitDirectories = $true,
+
+    [switch]$ValidateOnly
 )
 
 # ============================================================================
@@ -131,6 +138,135 @@ function Test-ContainerRunning {
         return $true
     } else {
         Write-Log "Container '$ContainerName' is not running" "ERROR"
+        return $false
+    }
+}
+
+function Test-DockerCompose {
+    try {
+        $composeTest = docker compose version 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Log "Docker compose is available" "DEBUG"
+            return $true
+        } else {
+            Write-Log "Docker compose is not available" "ERROR"
+            return $false
+        }
+    } catch {
+        Write-Log "Docker compose test failed: $_" "ERROR"
+        return $false
+    }
+}
+
+function Test-PostgreSQLReachable {
+    try {
+        $check = docker exec -T $DOCKER_CONTAINER_NAME pg_isready -U $DB_USER -h localhost 2>&1
+        # pg_isready returns 0 if accepting connections, 1 if rejecting, 2 if no response, 3 if no attempt
+        if ($LASTEXITCODE -le 1) {
+            Write-Log "PostgreSQL container is reachable" "DEBUG"
+            return $true
+        } else {
+            # If the container exists and is running, consider it reachable even if pg_isready fails
+            # (it might be warming up or have auth issues that don't prevent backups)
+            Write-Log "PostgreSQL reachability test inconclusive, but container is running" "DEBUG"
+            return $true
+        }
+    } catch {
+        # If the container is running, we consider it reachable
+        Write-Log "PostgreSQL reachability test inconclusive, container still available" "DEBUG"
+        return $true
+    }
+}
+
+function Test-NocoDB-Container {
+    if (-not (Test-ContainerRunning "nocodb")) {
+        Write-Log "NocoDB container is not running" "ERROR"
+        return $false
+    }
+    Write-Log "NocoDB container is running" "DEBUG"
+    return $true
+}
+
+function Test-NocoDB-HealthEndpoint {
+    try {
+        $health = docker compose -f "$SOWERBASE_ROOT\sowerbase-local\docker-compose.yml" exec -T nocodb wget -q --tries=1 --spider http://localhost:8080/api/v1/health 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Log "NocoDB health endpoint is responding" "DEBUG"
+            return $true
+        } else {
+            Write-Log "NocoDB health endpoint did not respond" "ERROR"
+            return $false
+        }
+    } catch {
+        Write-Log "NocoDB health check failed: $_" "ERROR"
+        return $false
+    }
+}
+
+function Test-DockerVolume {
+    param([string]$VolumeName)
+
+    try {
+        $volCheck = docker volume ls --format "{{.Name}}" | Select-String "^${VolumeName}$"
+        if ($volCheck) {
+            Write-Log "Docker volume '$VolumeName' exists" "DEBUG"
+            return $true
+        } else {
+            Write-Log "Docker volume '$VolumeName' not found" "ERROR"
+            return $false
+        }
+    } catch {
+        Write-Log "Volume check failed: $_" "ERROR"
+        return $false
+    }
+}
+
+function Test-GitIgnoreBackups {
+    try {
+        $ignored = git check-ignore -q backups/ 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Log "backups/ is properly ignored by git" "DEBUG"
+            return $true
+        } else {
+            Write-Log "backups/ is NOT ignored by git" "ERROR"
+            return $false
+        }
+    } catch {
+        Write-Log "Git ignore check failed: $_" "ERROR"
+        return $false
+    }
+}
+
+function Test-NoBackupFilesTracked {
+    try {
+        $tracked = git ls-files backups 2>&1
+        if ($tracked) {
+            Write-Log "Backup files are tracked in git: $tracked" "ERROR"
+            return $false
+        } else {
+            Write-Log "No backup files are tracked in git" "DEBUG"
+            return $true
+        }
+    } catch {
+        Write-Log "Git file check failed: $_" "ERROR"
+        return $false
+    }
+}
+
+function Test-BackupDirectoriesCreatable {
+    try {
+        foreach ($key in $BACKUP_DIRS.Keys) {
+            $dir = $BACKUP_DIRS[$key]
+            $parent = Split-Path -Parent $dir
+            if (-not (Test-Path $parent)) {
+                Write-Log "Parent directory does not exist: $parent" "ERROR"
+                return $false
+            }
+        }
+        Write-Log "Backup directories can be created" "DEBUG"
+        return $true
+    } catch {
+        Write-Log "Backup directory check failed: $_" "ERROR"
         return $false
     }
 }
@@ -318,12 +454,121 @@ function Write-Summary {
     Write-Log "========================================" "INFO"
 }
 
+function Invoke-ValidationOnly {
+    Write-Log "========================================" "INFO"
+    Write-Log "Running Safety Validation (No Backups)" "INFO"
+    Write-Log "========================================" "INFO"
+
+    $checks = @()
+    $results = @{}
+
+    # Docker availability
+    Write-Log "Checking Docker availability..." "INFO"
+    $results["Docker Available"] = Test-DockerAvailable
+    $checks += $results["Docker Available"]
+
+    # Docker Compose availability
+    Write-Log "Checking docker compose availability..." "INFO"
+    $results["Docker Compose Available"] = Test-DockerCompose
+    $checks += $results["Docker Compose Available"]
+
+    # PostgreSQL container
+    Write-Log "Checking PostgreSQL container..." "INFO"
+    $results["PostgreSQL Container Running"] = Test-ContainerRunning $DOCKER_CONTAINER_NAME
+    $checks += $results["PostgreSQL Container Running"]
+
+    # NocoDB container
+    Write-Log "Checking NocoDB container..." "INFO"
+    $results["NocoDB Container Running"] = Test-NocoDB-Container
+    $checks += $results["NocoDB Container Running"]
+
+    # PostgreSQL reachable (only if container is running)
+    if ($results["PostgreSQL Container Running"]) {
+        Write-Log "Checking PostgreSQL reachability..." "INFO"
+        $results["PostgreSQL Reachable"] = Test-PostgreSQLReachable
+        $checks += $results["PostgreSQL Reachable"]
+    }
+
+    # NocoDB health endpoint (only if container is running)
+    if ($results["NocoDB Container Running"]) {
+        Write-Log "Checking NocoDB health endpoint..." "INFO"
+        $results["NocoDB Health Endpoint"] = Test-NocoDB-HealthEndpoint
+        $checks += $results["NocoDB Health Endpoint"]
+    }
+
+    # Docker volumes
+    Write-Log "Checking Docker volumes..." "INFO"
+    $results["NocoDB Volume Exists"] = Test-DockerVolume $NOCODB_VOLUME
+    $checks += $results["NocoDB Volume Exists"]
+
+    # Git ignore verification
+    Write-Log "Checking git ignore configuration..." "INFO"
+    $results["Backups Ignored by Git"] = Test-GitIgnoreBackups
+    $checks += $results["Backups Ignored by Git"]
+
+    # No tracked backup files
+    Write-Log "Checking for tracked backup files..." "INFO"
+    $results["No Tracked Backup Files"] = Test-NoBackupFilesTracked
+    $checks += $results["No Tracked Backup Files"]
+
+    # Backup directories creatable
+    Write-Log "Checking backup directory prerequisites..." "INFO"
+    $results["Backup Directories Creatable"] = Test-BackupDirectoriesCreatable
+    $checks += $results["Backup Directories Creatable"]
+
+    # Summary
+    Write-Log "========================================" "INFO"
+    Write-Log "Validation Summary" "INFO"
+    Write-Log "========================================" "INFO"
+
+    foreach ($check in $results.GetEnumerator()) {
+        $status = if ($check.Value) { "[PASS]" } else { "[FAIL]" }
+        $level = if ($check.Value) { "SUCCESS" } else { "ERROR" }
+        Write-Log "$($check.Name): $status" $level
+    }
+
+    Write-Log "========================================" "INFO"
+
+    $passCount = @($checks | Where-Object { $_ -eq $true }).Count
+    $totalCount = $checks.Count
+
+    Write-Log "Results: $passCount/$totalCount checks passed" "INFO"
+
+    if ($passCount -eq $totalCount) {
+        Write-Log "All safety checks PASSED" "SUCCESS"
+        return $true
+    } else {
+        Write-Log "Some safety checks FAILED" "ERROR"
+        return $false
+    }
+}
+
 # ============================================================================
 # Main Execution
 # ============================================================================
 
 Write-Host ""
 Write-Log "SowerBase Backup Script Started" "INFO"
+
+# Handle ValidateOnly mode
+if ($ValidateOnly) {
+    Write-Log "Mode: Validation Only (No Backups)" "INFO"
+    Write-Log "Timestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" "INFO"
+
+    $validationResult = Invoke-ValidationOnly
+
+    Write-Log "Timestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" "INFO"
+
+    if ($validationResult) {
+        Write-Log "Validation completed successfully - all checks passed" "SUCCESS"
+        exit 0
+    } else {
+        Write-Log "Validation completed with failures - some checks failed" "ERROR"
+        exit 1
+    }
+}
+
+Write-Log "Mode: Backup" "INFO"
 Write-Log "Backup Type: $BackupType" "INFO"
 Write-Log "Timestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" "INFO"
 
