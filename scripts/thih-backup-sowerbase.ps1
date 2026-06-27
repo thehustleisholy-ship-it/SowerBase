@@ -432,26 +432,82 @@ function Backup-PostgreSQL {
         Write-Log "Output: $backupFile" "DEBUG"
         Write-Log "Starting dump operation..." "INFO"
 
-        # Execute pg_dump via Docker
+        # Log active database sequences before dump
+        Write-Log "Capturing active database sequences..." "DEBUG"
+        $env:PGPASSWORD = $DbPassword
+        $activeSequences = docker exec $DOCKER_CONTAINER_NAME psql -U $DB_USER -h localhost -d $DB_NAME -t -c "SELECT sequence_name FROM information_schema.sequences WHERE sequence_schema = 'public' ORDER BY sequence_name;" 2>$null
+        [System.Environment]::SetEnvironmentVariable('PGPASSWORD', $null)
+
+        $activeSeqList = @($activeSequences -split "`n" | Where-Object { $_ -match '\S' } | ForEach-Object { $_.Trim() })
+        Write-Log "Active sequences: $($activeSeqList.Count) found: $($activeSeqList -join ', ')" "DEBUG"
+
+        # Execute pg_dump via Docker with options for complete schema
         $env:PGPASSWORD = $DbPassword
 
-        # Create the backup file using docker exec and pipe to Out-File
+        # Create the backup file using docker exec - NO 2>&1 to avoid mixing verbose output with SQL
+        # Options: -F p (plain text), --schema public (explicit schema), --no-owner (compatible restore)
+        # DO NOT use --verbose to keep dump clean
         $dumpProcess = docker exec -i $DOCKER_CONTAINER_NAME pg_dump `
             -U $DB_USER `
             -h localhost `
             -F p `
-            --verbose `
-            $DB_NAME 2>&1
+            --no-owner `
+            --schema=public `
+            $DB_NAME
 
         if ($LASTEXITCODE -eq 0) {
             $dumpProcess | Out-File -FilePath $backupFile -Encoding UTF8
 
             if (Test-Path $backupFile) {
-                $fileSize = Get-FileSize $backupFile
+                # Validate dump completeness
+                Write-Log "Validating PostgreSQL dump completeness..." "DEBUG"
+
+                $dumpContent = Get-Content $backupFile -Raw
+                $dumpSize = (Get-Item $backupFile).Length
+
+                # Verify dump contains required schema objects
+                $missingObjects = @()
+
+                # Check for CREATE SEQUENCE statements
+                if ($dumpContent -notmatch "CREATE SEQUENCE") {
+                    $missingObjects += "CREATE SEQUENCE"
+                }
+
+                # Check for specific required sequences
+                foreach ($seqName in $activeSeqList) {
+                    if ($dumpContent -notmatch [regex]::Escape($seqName)) {
+                        $missingObjects += "sequence: $seqName"
+                    }
+                }
+
+                # Check for nc_store_id_seq specifically (critical)
+                if ($dumpContent -notmatch "nc_store_id_seq") {
+                    $missingObjects += "CRITICAL: nc_store_id_seq (required for NocoDB)"
+                }
+
+                # Check for ALTER TABLE DEFAULT statements
+                if ($dumpContent -notmatch "ALTER TABLE.*ALTER COLUMN.*SET DEFAULT") {
+                    $missingObjects += "ALTER TABLE DEFAULT statements"
+                }
+
+                if ($missingObjects.Count -gt 0) {
+                    Write-Log "PostgreSQL backup VALIDATION FAILED - Missing schema objects:" "ERROR"
+                    foreach ($missing in $missingObjects) {
+                        Write-Log "  ✗ $missing" "ERROR"
+                    }
+                    Add-Content -Path $BACKUP_LOG -Value "[$(Get-Date)] POSTGRES_BACKUP_VALIDATION_FAILED Missing: $($missingObjects -join '; ')"
+                    Remove-Item -ErrorAction SilentlyContinue env:PGPASSWORD
+                    return $false
+                }
+
+                # Dump is valid
+                $dumpSizeKB = [math]::Round($dumpSize / 1KB, 2)
                 Write-Log "PostgreSQL backup completed successfully" "SUCCESS"
                 Write-Log "  File: $backupFile" "INFO"
-                Write-Log "  Size: $fileSize" "INFO"
-                Add-Content -Path $BACKUP_LOG -Value "[$(Get-Date)] POSTGRES_BACKUP_SUCCESS $backupFile ($fileSize)"
+                Write-Log "  Size: $dumpSizeKB KB" "INFO"
+                Write-Log "  Sequences in dump: $($activeSeqList.Count)" "INFO"
+                Write-Log "  Dump validation: PASSED" "SUCCESS"
+                Add-Content -Path $BACKUP_LOG -Value "[$(Get-Date)] POSTGRES_BACKUP_SUCCESS $backupFile ($dumpSizeKB KB) Sequences: $($activeSeqList.Count)"
 
                 # Cleanup
                 Remove-Item -ErrorAction SilentlyContinue env:PGPASSWORD
