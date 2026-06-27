@@ -140,3 +140,13 @@ antd.variable.css
 .nc-dev-proxy.pid
 .nc-dev-proxy.log
 .nc-dev-logs/
+
+# Environment files - DO NOT COMMIT CREDENTIALS
+# ================================================
+# Staging and production credentials must never be committed to git.
+# Store credentials securely in environment, vault, or host configuration.
+# Templates (.example) are safe to commit; actual credentials are not.
+.env
+.env.*
+# Except example/template files
+!.env.*.example
