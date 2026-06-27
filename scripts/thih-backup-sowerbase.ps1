@@ -167,7 +167,7 @@ function Test-DockerCompose {
 
 function Test-PostgreSQLReachable {
     try {
-        $check = docker exec -T $DOCKER_CONTAINER_NAME pg_isready -U $DB_USER -h localhost 2>&1
+        $check = docker exec $DOCKER_CONTAINER_NAME pg_isready -U $DB_USER -h localhost 2>&1
         # pg_isready returns 0 if accepting connections, 1 if rejecting, 2 if no response, 3 if no attempt
         if ($LASTEXITCODE -le 1) {
             Write-Log "PostgreSQL container is reachable" "DEBUG"
@@ -321,7 +321,7 @@ function Test-PostgreSQLCredentials {
     try {
         Write-Log "Verifying PostgreSQL credentials..." "DEBUG"
         $env:PGPASSWORD = $DbPassword
-        $testConnection = docker exec -T $DOCKER_CONTAINER_NAME psql -U $DB_USER -h localhost -d postgres -c "SELECT 1;" 2>&1
+        $testConnection = docker exec $DOCKER_CONTAINER_NAME psql -U $DB_USER -h localhost -d postgres -c "SELECT 1;" 2>&1
 
         if ($LASTEXITCODE -eq 0) {
             Write-Log "PostgreSQL credentials verified" "SUCCESS"
