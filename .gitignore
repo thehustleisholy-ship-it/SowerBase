@@ -96,6 +96,22 @@ httpbin
 /packages/nc-secret-mgr/dist/index.js
 /packages/nc-secret-mgr/dist/index.js.map
 
+# Local SowerBase Backups - NEVER commit to git
+# ================================================
+# Backup files contain operational data and must remain local/private.
+# Keep backup artifacts out of source control and away from shared sync folders.
+backups/
+*.sql
+*.dump
+*.sql.gz
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.bak
+*.backup
+
 # nix
 result
 
