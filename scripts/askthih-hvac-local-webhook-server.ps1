@@ -15,7 +15,7 @@
 #>
 
 param(
-    [int]$Port = 8787,
+    [int]$Port = $(if ($env:ASKTHIH_WEBHOOK_PORT) { [int]$env:ASKTHIH_WEBHOOK_PORT } else { 8787 }),
     [string]$OutputLog = "$PSScriptRoot/../backups/WEBHOOK_SERVER_LOG.txt"
 )
 
