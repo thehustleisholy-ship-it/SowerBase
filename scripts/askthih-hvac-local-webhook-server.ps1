@@ -34,6 +34,67 @@ function Write-Log {
     Add-Content -Path $OutputLog -Value $line -ErrorAction SilentlyContinue
 }
 
+function Send-JsonResponse {
+    param(
+        [Parameter(Mandatory = $true)] [System.Net.HttpListenerResponse]$Response,
+        [Parameter(Mandatory = $true)] [int]$StatusCode,
+        [Parameter(Mandatory = $true)] [hashtable]$Body
+    )
+
+    $responseBody = $Body | ConvertTo-Json
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($responseBody)
+
+    $Response.StatusCode = $StatusCode
+    $Response.Headers.Add("Content-Type", "application/json")
+    $Response.ContentLength64 = $bytes.Length
+    $Response.OutputStream.Write($bytes, 0, $bytes.Length)
+    $Response.Close()
+}
+
+function Get-RecordIdFromApiRecord {
+    param($Record)
+
+    foreach ($propertyName in @("id", "Id", "ID")) {
+        if ($Record.PSObject.Properties.Name -contains $propertyName) {
+            return $Record.$propertyName
+        }
+    }
+
+    return $null
+}
+
+function Find-SowerBaseRecordByChannel {
+    param(
+        [Parameter(Mandatory = $true)] [string]$ApiUrl,
+        [Parameter(Mandatory = $true)] [hashtable]$Headers,
+        [Parameter(Mandatory = $true)] [string]$Channel
+    )
+
+    $where = [System.Uri]::EscapeDataString("(Channel,eq,$Channel)")
+    $lookupUrl = "${ApiUrl}?where=$where&limit=1"
+
+    $lookupResponse = Invoke-WebRequest -Uri $lookupUrl `
+        -Method GET `
+        -Headers $Headers `
+        -TimeoutSec 3 `
+        -ErrorAction Stop
+
+    if ($lookupResponse.StatusCode -ne 200) {
+        return $null
+    }
+
+    $lookupData = $lookupResponse.Content | ConvertFrom-Json
+    if ($lookupData.list -and $lookupData.list.Count -gt 0) {
+        return $lookupData.list[0]
+    }
+
+    if ($lookupData.Count -gt 0) {
+        return $lookupData[0]
+    }
+
+    return $null
+}
+
 Write-Log "AskTHIH HVAC Local Webhook Server Starting"
 Write-Log "Port: $Port"
 Write-Log "Endpoint: http://localhost:$Port/askthih/hvac"
@@ -172,16 +233,19 @@ while (-not $shutdown) {
 
         if ($request.HttpMethod -ne "POST") {
             Write-Log "Rejected non-POST request: $($request.HttpMethod)" "DEBUG"
-            $response.StatusCode = 405
-            $response.Headers.Add("Content-Type", "application/json")
-            $responseBody = @{
+            Send-JsonResponse -Response $response -StatusCode 405 -Body @{
                 status = "error"
                 message = "Method not allowed. Use POST."
-            } | ConvertTo-Json
-            $bytes = [System.Text.Encoding]::UTF8.GetBytes($responseBody)
-            $response.ContentLength64 = $bytes.Length
-            $response.OutputStream.Write($bytes, 0, $bytes.Length)
-            $response.Close()
+            }
+            continue
+        }
+
+        if ($request.ContentType -notmatch "^application/json($|;)") {
+            Write-Log "Rejected unsupported content type: $($request.ContentType)" "DEBUG"
+            Send-JsonResponse -Response $response -StatusCode 415 -Body @{
+                status = "error"
+                message = "Unsupported media type. Use application/json."
+            }
             continue
         }
 
@@ -303,6 +367,11 @@ while (-not $shutdown) {
         $baseUrl = $env:SOWERBASE_BASE_URL
         $tableId = $env:SOWERBASE_INTAKE_TABLE_ID
         $apiUrl = "$baseUrl/api/v2/tables/$tableId/records"
+        $apiHeaders = @{
+            "Authorization" = "Bearer $apiToken"
+            "Content-Type" = "application/json"
+            "xc-auth" = $apiToken
+        }
 
         Write-Log "API endpoint: [redacted for security]" "DEBUG"
 
@@ -310,12 +379,9 @@ while (-not $shutdown) {
         try {
             $response_api = Invoke-WebRequest -Uri $apiUrl `
                 -Method POST `
-                -Headers @{
-                    "Authorization" = "Bearer $apiToken"
-                    "Content-Type" = "application/json"
-                    "xc-auth" = $apiToken
-                } `
+                -Headers $apiHeaders `
                 -Body ($apiPayload | ConvertTo-Json) `
+                -TimeoutSec 6 `
                 -ErrorAction Stop
 
             if ($response_api.StatusCode -eq 200 -or $response_api.StatusCode -eq 201) {
@@ -326,50 +392,50 @@ while (-not $shutdown) {
 
                 Write-Log "Record ID: $recordId" "SUCCESS"
 
-                $responseBody = @{
+                Send-JsonResponse -Response $response -StatusCode 201 -Body @{
                     status = "success"
                     message = "HVAC intake received and stored"
                     record_id = $recordId
                     method = "sowerbase-api"
-                } | ConvertTo-Json
-
-                $response.StatusCode = 201
-                $response.Headers.Add("Content-Type", "application/json")
-                $bytes = [System.Text.Encoding]::UTF8.GetBytes($responseBody)
-                $response.ContentLength64 = $bytes.Length
-                $response.OutputStream.Write($bytes, 0, $bytes.Length)
+                }
 
                 Write-Log "Response: 201 Created (SowerBase API)"
+                continue
             } else {
                 Write-Log "ERROR: Unexpected response from SowerBase API: $($response_api.StatusCode)" "ERROR"
-                $response.StatusCode = 500
-                $response.Headers.Add("Content-Type", "application/json")
-                $responseBody = @{
+                Send-JsonResponse -Response $response -StatusCode 500 -Body @{
                     status = "error"
                     message = "SowerBase API error"
-                } | ConvertTo-Json
-                $bytes = [System.Text.Encoding]::UTF8.GetBytes($responseBody)
-                $response.ContentLength64 = $bytes.Length
-                $response.OutputStream.Write($bytes, 0, $bytes.Length)
-                $response.Close()
+                }
                 continue
             }
         } catch {
             Write-Log "ERROR: SowerBase API request failed: $($_.Exception.Message)" "ERROR"
-            $response.StatusCode = 500
-            $response.Headers.Add("Content-Type", "application/json")
-            $responseBody = @{
+
+            try {
+                Write-Log "Attempting recovery read-back by channel: $($payload.channel)" "INFO"
+                $recoveredRecord = Find-SowerBaseRecordByChannel -ApiUrl $apiUrl -Headers $apiHeaders -Channel $payload.channel
+                if ($recoveredRecord) {
+                    $recordId = Get-RecordIdFromApiRecord -Record $recoveredRecord
+                    Write-Log "RECOVERED: Found record after create failure. Record ID: $recordId" "SUCCESS"
+                    Send-JsonResponse -Response $response -StatusCode 201 -Body @{
+                        status = "success"
+                        message = "HVAC intake received and stored"
+                        record_id = $recordId
+                        method = "recovered_readback"
+                    }
+                    continue
+                }
+            } catch {
+                Write-Log "ERROR: Recovery read-back failed: $($_.Exception.Message)" "ERROR"
+            }
+
+            Send-JsonResponse -Response $response -StatusCode 500 -Body @{
                 status = "error"
-                message = "Failed to create record"
-            } | ConvertTo-Json
-            $bytes = [System.Text.Encoding]::UTF8.GetBytes($responseBody)
-            $response.ContentLength64 = $bytes.Length
-            $response.OutputStream.Write($bytes, 0, $bytes.Length)
-            $response.Close()
+                message = "Failed to create record and recovery read-back found no matching row"
+            }
             continue
         }
-
-        $response.Close()
 
     } catch {
         Write-Log "ERROR: Request handler exception: $($_.Exception.Message)" "ERROR"
