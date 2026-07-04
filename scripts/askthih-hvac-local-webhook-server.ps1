@@ -109,7 +109,8 @@ Write-Log "Checking prerequisites..."
 $requiredVars = @(
     "SOWERBASE_BASE_URL",
     "SOWERBASE_API_TOKEN",
-    "SOWERBASE_INTAKE_TABLE_ID"
+    "SOWERBASE_INTAKE_TABLE_ID",
+    "ASKTHIH_WEBHOOK_SECRET"
 )
 
 foreach ($var in $requiredVars) {
@@ -121,6 +122,7 @@ foreach ($var in $requiredVars) {
 
 Write-Log "SowerBase API environment variables verified"
 Write-Log "SOWERBASE_BASE_URL configured (token redacted)" "DEBUG"
+$webhookSecret = $env:ASKTHIH_WEBHOOK_SECRET
 
 # ============================================================================
 # HTTP Listener Setup
@@ -249,6 +251,15 @@ while (-not $shutdown) {
             continue
         }
 
+        $providedSecret = $request.Headers["X-AskTHIH-Webhook-Secret"]
+        if ([string]::IsNullOrWhiteSpace($providedSecret) -or -not [System.String]::Equals($providedSecret, $webhookSecret, [System.StringComparison]::Ordinal)) {
+            Write-Log "Rejected unauthorized webhook request" "WARN"
+            Send-JsonResponse -Response $response -StatusCode 401 -Body @{
+                status = "error"
+                message = "Unauthorized"
+            }
+            continue
+        }
         # Read request body safely
         $body = ""
         try {
