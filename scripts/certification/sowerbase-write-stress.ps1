@@ -218,8 +218,10 @@ function Invoke-CertWebhookRequest {
         $timedOut = $false
         $message = $_.Exception.Message
 
-        if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+        if ($_.Exception.PSObject.Properties.Name -contains "Response" -and $_.Exception.Response -and $_.Exception.Response.StatusCode) {
             $statusCode = [int]$_.Exception.Response.StatusCode
+        } elseif ($_.Exception.PSObject.Properties.Name -contains "StatusCode" -and $_.Exception.StatusCode) {
+            $statusCode = [int]$_.Exception.StatusCode
         } elseif ($message -match "timed out|timeout|operation has timed out") {
             $statusCode = "TIMEOUT"
             $timedOut = $true
@@ -305,8 +307,10 @@ function Invoke-CertWebhookBatch {
             $timedOut = $false
             $message = $_.Exception.Message
 
-            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+            if ($_.Exception.PSObject.Properties.Name -contains "Response" -and $_.Exception.Response -and $_.Exception.Response.StatusCode) {
                 $statusCode = [int]$_.Exception.Response.StatusCode
+            } elseif ($_.Exception.PSObject.Properties.Name -contains "StatusCode" -and $_.Exception.StatusCode) {
+                $statusCode = [int]$_.Exception.StatusCode
             } elseif ($message -match "timed out|timeout|operation has timed out") {
                 $statusCode = "TIMEOUT"
                 $timedOut = $true
@@ -780,4 +784,7 @@ if ($candidateRuling -like "FAIL*") {
 }
 
 exit 0
+
+
+
 
