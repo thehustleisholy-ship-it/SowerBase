@@ -96,6 +96,182 @@ function Find-SowerBaseRecordByChannel {
 }
 
 
+function Get-RecordIdFromAirtableRecord {
+    param($Record)
+
+    if ($Record -and ($Record.PSObject.Properties.Name -contains "id")) {
+        return $Record.id
+    }
+
+    return $null
+}
+
+function New-AirtableFieldsFromPayload {
+    param($Payload)
+
+    $fields = [ordered]@{
+        "Name" = $Payload.contact_name
+        "phoneNumber" = $Payload.phone
+        "Email" = $Payload.email
+        "Address" = $Payload.service_address
+        "Transcript" = $(if ($Payload.transcript) { $Payload.transcript } else { $Payload.problem_description })
+        "System Type" = $(if ($Payload.system_type) { $Payload.system_type } else { "" })
+        "System Age" = $(if ($Payload.system_age_years) { $Payload.system_age_years } else { "" })
+        "Preferred Service Window" = $(if ($Payload.preferred_service_window) { $Payload.preferred_service_window } else { "" })
+        "Preferred Callback Time" = $(if ($Payload.preferred_callback_time) { $Payload.preferred_callback_time } else { "" })
+        "Trace ID" = $(if ($Payload.trace_id) { $Payload.trace_id } else { "" })
+        "Channel" = $Payload.channel
+        "Status" = $Payload.status
+        "Raw Payload" = ($Payload | ConvertTo-Json -Depth 12)
+    }
+
+    return $fields
+}
+
+function Invoke-AirtableFallback {
+    param(
+        [Parameter(Mandatory = $true)] $Payload,
+        [Parameter(Mandatory = $true)] [string]$Mode
+    )
+
+    $token = if ($env:AIRTABLE_API_TOKEN) { $env:AIRTABLE_API_TOKEN } else { $env:AIRTABLE_TOKEN }
+    $baseId = if ($env:AIRTABLE_BASE_ID) { $env:AIRTABLE_BASE_ID } else { "app60wQWdbbgyqTcL" }
+    $tableName = if ($env:AIRTABLE_HVAC_TABLE_NAME) { $env:AIRTABLE_HVAC_TABLE_NAME } else { "HVAC Intake" }
+
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        return [pscustomobject]@{
+            ok = $false
+            status = "unconfigured"
+            record_id = $null
+            message = "Airtable token not configured"
+        }
+    }
+
+    $encodedTableName = [System.Uri]::EscapeDataString($tableName)
+    $airtableUrl = "https://api.airtable.com/v0/$baseId/$encodedTableName"
+    $airtableHeaders = @{
+        "Authorization" = "Bearer $token"
+        "Content-Type" = "application/json"
+    }
+    $airtableBody = @{
+        records = @(
+            @{
+                fields = New-AirtableFieldsFromPayload -Payload $Payload
+            }
+        )
+        typecast = $true
+    } | ConvertTo-Json -Depth 12
+
+    try {
+        $airtableResponse = Invoke-WebRequest -Uri $airtableUrl `
+            -Method POST `
+            -Headers $airtableHeaders `
+            -Body $airtableBody `
+            -TimeoutSec 6 `
+            -ErrorAction Stop
+
+        $airtableData = $airtableResponse.Content | ConvertFrom-Json
+        $recordId = $null
+        if ($airtableData.records -and $airtableData.records.Count -gt 0) {
+            $recordId = Get-RecordIdFromAirtableRecord -Record $airtableData.records[0]
+        }
+
+        return [pscustomobject]@{
+            ok = $true
+            status = if ($Mode -eq "shadow") { "shadow_created" } else { "fallback_created" }
+            record_id = $recordId
+            message = "Airtable write accepted"
+        }
+    } catch {
+        return [pscustomobject]@{
+            ok = $false
+            status = if ($Mode -eq "shadow") { "shadow_failed" } else { "fallback_failed" }
+            record_id = $null
+            message = $_.Exception.Message
+        }
+    }
+}
+
+function Invoke-SowerBaseCreate {
+    param(
+        [Parameter(Mandatory = $true)] [hashtable]$ApiPayload,
+        [Parameter(Mandatory = $true)] $OriginalPayload
+    )
+
+    $apiToken = $env:SOWERBASE_API_TOKEN
+    if (-not $apiToken) {
+        return [pscustomobject]@{
+            ok = $false
+            status = "configuration_error"
+            record_id = $null
+            method = "sowerbase-api"
+            message = "SOWERBASE_API_TOKEN required"
+        }
+    }
+
+    $baseUrl = $env:SOWERBASE_BASE_URL
+    $tableId = $env:SOWERBASE_INTAKE_TABLE_ID
+    $apiUrl = "$baseUrl/api/v2/tables/$tableId/records"
+    $apiHeaders = @{
+        "Authorization" = "Bearer $apiToken"
+        "Content-Type" = "application/json"
+        "xc-auth" = $apiToken
+    }
+
+    try {
+        $response_api = Invoke-WebRequest -Uri $apiUrl `
+            -Method POST `
+            -Headers $apiHeaders `
+            -Body ($ApiPayload | ConvertTo-Json -Depth 12) `
+            -TimeoutSec 6 `
+            -ErrorAction Stop
+
+        if ($response_api.StatusCode -eq 200 -or $response_api.StatusCode -eq 201) {
+            $responseData = $response_api.Content | ConvertFrom-Json
+            return [pscustomobject]@{
+                ok = $true
+                status = "created"
+                record_id = $responseData.id
+                method = "sowerbase-api"
+                message = "SowerBase write accepted"
+            }
+        }
+
+        return [pscustomobject]@{
+            ok = $false
+            status = "unexpected_status"
+            record_id = $null
+            method = "sowerbase-api"
+            message = "Unexpected SowerBase API status: $($response_api.StatusCode)"
+        }
+    } catch {
+        try {
+            Write-Log "Attempting recovery read-back by channel: $($OriginalPayload.channel)" "INFO"
+            $recoveredRecord = Find-SowerBaseRecordByChannel -ApiUrl $apiUrl -Headers $apiHeaders -Channel $OriginalPayload.channel
+            if ($recoveredRecord) {
+                $recordId = Get-RecordIdFromApiRecord -Record $recoveredRecord
+                return [pscustomobject]@{
+                    ok = $true
+                    status = "recovered_readback"
+                    record_id = $recordId
+                    method = "recovered_readback"
+                    message = "Found record after create failure"
+                }
+            }
+        } catch {
+            Write-Log "ERROR: Recovery read-back failed: $($_.Exception.Message)" "ERROR"
+        }
+
+        return [pscustomobject]@{
+            ok = $false
+            status = "create_failed"
+            record_id = $null
+            method = "sowerbase-api"
+            message = $_.Exception.Message
+        }
+    }
+}
+
 function ConvertTo-Hex {
     param([byte[]]$Bytes)
     return -join ($Bytes | ForEach-Object { "{0:x2}" -f $_ })
@@ -441,6 +617,7 @@ while (-not $shutdown) {
             "Urgency" = $payload.urgency
             "Channel" = $payload.channel
             "Status" = $payload.status
+            "Follow-up Status" = $(if ($payload.follow_up_status) { $payload.follow_up_status } else { "New" })
             "Trace ID" = $(if ($payload.trace_id) { $payload.trace_id } else { "" })
             "Submitted At" = $(if ($payload.submitted_at) { $payload.submitted_at } else { (Get-Date -AsUTC).ToString("o") })
             "Transcript" = $(if ($payload.transcript) { $payload.transcript } else { "" })
@@ -459,101 +636,132 @@ while (-not $shutdown) {
         }
 
         # ====================================================================
-        # Call SowerBase/NocoDB API (API-Safe Pattern Only)
+        # Operational routing: SowerBase primary, Airtable fallback/shadow
         # ====================================================================
 
-        Write-Log "Creating intake record via SowerBase/NocoDB API..." "INFO"
+        $routingMode = if ($env:ASKTHIH_HVAC_INTAKE_PRIMARY) { $env:ASKTHIH_HVAC_INTAKE_PRIMARY.ToLowerInvariant() } else { "sowerbase" }
+        $airtableMode = if ($env:ASKTHIH_HVAC_AIRTABLE_MODE) { $env:ASKTHIH_HVAC_AIRTABLE_MODE.ToLowerInvariant() } else { "fallback" }
+        $rollbackPrimary = if ($env:ASKTHIH_HVAC_ROLLBACK_PRIMARY) { $env:ASKTHIH_HVAC_ROLLBACK_PRIMARY.ToLowerInvariant() } else { "" }
 
-        $apiToken = $env:SOWERBASE_API_TOKEN
-        if (-not $apiToken) {
-            Write-Log "ERROR: SOWERBASE_API_TOKEN required (no fallback available)" "ERROR"
-            $response.StatusCode = 500
-            $response.Headers.Add("Content-Type", "application/json")
-            $responseBody = @{
-                status = "error"
-                message = "Server configuration error"
-            } | ConvertTo-Json
-            $bytes = [System.Text.Encoding]::UTF8.GetBytes($responseBody)
-            $response.ContentLength64 = $bytes.Length
-            $response.OutputStream.Write($bytes, 0, $bytes.Length)
-            $response.Close()
-            continue
+        if ($rollbackPrimary -in @("1", "true", "airtable", "airtable_primary")) {
+            $routingMode = "airtable_primary"
         }
 
-        # Construct NocoDB API endpoint
-        $baseUrl = $env:SOWERBASE_BASE_URL
-        $tableId = $env:SOWERBASE_INTAKE_TABLE_ID
-        $apiUrl = "$baseUrl/api/v2/tables/$tableId/records"
-        $apiHeaders = @{
-            "Authorization" = "Bearer $apiToken"
-            "Content-Type" = "application/json"
-            "xc-auth" = $apiToken
-        }
+        Write-Log "HVAC routing mode: $routingMode" "INFO"
+        Write-Log "Airtable mode: $airtableMode" "INFO"
 
-        Write-Log "API endpoint: [redacted for security]" "DEBUG"
+        if ($routingMode -eq "airtable_primary") {
+            Write-Log "Rollback active: writing HVAC intake to Airtable primary path" "WARN"
+            $airtableResult = Invoke-AirtableFallback -Payload $payload -Mode "fallback"
 
-        # Call SowerBase API to create record
-        try {
-            $response_api = Invoke-WebRequest -Uri $apiUrl `
-                -Method POST `
-                -Headers $apiHeaders `
-                -Body ($apiPayload | ConvertTo-Json) `
-                -TimeoutSec 6 `
-                -ErrorAction Stop
-
-            if ($response_api.StatusCode -eq 200 -or $response_api.StatusCode -eq 201) {
-                Write-Log "SUCCESS: Record created via SowerBase/NocoDB API" "SUCCESS"
-
-                $responseData = $response_api.Content | ConvertFrom-Json
-                $recordId = $responseData.id
-
-                Write-Log "Record ID: $recordId" "SUCCESS"
-
+            if ($airtableResult.ok) {
                 Send-JsonResponse -Response $response -StatusCode 201 -Body @{
                     status = "success"
-                    message = "HVAC intake received and stored"
-                    record_id = $recordId
-                    method = "sowerbase-api"
-                }
-
-                Write-Log "Response: 201 Created (SowerBase API)"
-                continue
-            } else {
-                Write-Log "ERROR: Unexpected response from SowerBase API: $($response_api.StatusCode)" "ERROR"
-                Send-JsonResponse -Response $response -StatusCode 500 -Body @{
-                    status = "error"
-                    message = "SowerBase API error"
+                    message = "HVAC intake received through Airtable rollback path"
+                    record_id = $airtableResult.record_id
+                    method = "airtable-api"
+                    routing_mode = "airtable_primary"
+                    fallback_status = $airtableResult.status
+                    airtable_status = $airtableResult.status
                 }
                 continue
             }
-        } catch {
-            Write-Log "ERROR: SowerBase API request failed: $($_.Exception.Message)" "ERROR"
 
-            try {
-                Write-Log "Attempting recovery read-back by channel: $($payload.channel)" "INFO"
-                $recoveredRecord = Find-SowerBaseRecordByChannel -ApiUrl $apiUrl -Headers $apiHeaders -Channel $payload.channel
-                if ($recoveredRecord) {
-                    $recordId = Get-RecordIdFromApiRecord -Record $recoveredRecord
-                    Write-Log "RECOVERED: Found record after create failure. Record ID: $recordId" "SUCCESS"
-                    Send-JsonResponse -Response $response -StatusCode 201 -Body @{
-                        status = "success"
-                        message = "HVAC intake received and stored"
-                        record_id = $recordId
-                        method = "recovered_readback"
-                    }
-                    continue
-                }
-            } catch {
-                Write-Log "ERROR: Recovery read-back failed: $($_.Exception.Message)" "ERROR"
-            }
-
+            Write-Log "ERROR: Airtable rollback write failed: $($airtableResult.status)" "ERROR"
             Send-JsonResponse -Response $response -StatusCode 500 -Body @{
                 status = "error"
-                message = "Failed to create record and recovery read-back found no matching row"
+                message = "Airtable rollback path failed"
+                routing_mode = "airtable_primary"
+                fallback_status = $airtableResult.status
+                airtable_status = $airtableResult.status
             }
             continue
         }
 
+        if ($routingMode -ne "sowerbase") {
+            Write-Log "ERROR: Unsupported HVAC routing mode: $routingMode" "ERROR"
+            Send-JsonResponse -Response $response -StatusCode 500 -Body @{
+                status = "error"
+                message = "Unsupported HVAC routing mode"
+                routing_mode = $routingMode
+                fallback_status = "not_attempted"
+                airtable_status = "not_attempted"
+            }
+            continue
+        }
+
+        Write-Log "Creating intake record via SowerBase/NocoDB API first..." "INFO"
+        Write-Log "API endpoint: [redacted for security]" "DEBUG"
+        $sowerBaseResult = Invoke-SowerBaseCreate -ApiPayload $apiPayload -OriginalPayload $payload
+
+        if ($sowerBaseResult.ok) {
+            Write-Log "SUCCESS: Record created via SowerBase primary path. Record ID: $($sowerBaseResult.record_id)" "SUCCESS"
+
+            $airtableStatus = "not_attempted"
+            if ($airtableMode -eq "shadow") {
+                Write-Log "Writing Airtable shadow copy for HVAC intake" "INFO"
+                $airtableShadow = Invoke-AirtableFallback -Payload $payload -Mode "shadow"
+                $airtableStatus = $airtableShadow.status
+                if ($airtableShadow.ok) {
+                    Write-Log "SUCCESS: Airtable shadow write accepted" "SUCCESS"
+                } else {
+                    Write-Log "WARN: Airtable shadow write did not complete: $airtableStatus" "WARN"
+                }
+            }
+
+            Send-JsonResponse -Response $response -StatusCode 201 -Body @{
+                status = "success"
+                message = "HVAC intake received and stored"
+                record_id = $sowerBaseResult.record_id
+                method = $sowerBaseResult.method
+                routing_mode = "sowerbase_primary"
+                fallback_status = "not_needed"
+                airtable_status = $airtableStatus
+            }
+
+            Write-Log "Response: 201 Created (SowerBase primary)"
+            continue
+        }
+
+        Write-Log "ERROR: SowerBase primary write failed: $($sowerBaseResult.status)" "ERROR"
+
+        if ($airtableMode -eq "fallback") {
+            Write-Log "Attempting Airtable fallback for HVAC intake" "WARN"
+            $airtableFallback = Invoke-AirtableFallback -Payload $payload -Mode "fallback"
+
+            if ($airtableFallback.ok) {
+                Write-Log "SUCCESS: Airtable fallback write accepted. Record ID: $($airtableFallback.record_id)" "SUCCESS"
+                Send-JsonResponse -Response $response -StatusCode 202 -Body @{
+                    status = "success"
+                    message = "HVAC intake stored through Airtable fallback after SowerBase failure"
+                    record_id = $airtableFallback.record_id
+                    method = "airtable-fallback"
+                    routing_mode = "sowerbase_primary"
+                    fallback_status = $airtableFallback.status
+                    airtable_status = $airtableFallback.status
+                }
+                continue
+            }
+
+            Write-Log "ERROR: Airtable fallback failed: $($airtableFallback.status)" "ERROR"
+            Send-JsonResponse -Response $response -StatusCode 500 -Body @{
+                status = "error"
+                message = "SowerBase primary failed and Airtable fallback failed"
+                routing_mode = "sowerbase_primary"
+                fallback_status = $airtableFallback.status
+                airtable_status = $airtableFallback.status
+            }
+            continue
+        }
+
+        Send-JsonResponse -Response $response -StatusCode 500 -Body @{
+            status = "error"
+            message = "SowerBase primary failed and Airtable fallback is disabled"
+            routing_mode = "sowerbase_primary"
+            fallback_status = "disabled"
+            airtable_status = "not_attempted"
+        }
+        continue
     } catch {
         Write-Log "ERROR: Request handler exception: $($_.Exception.Message)" "ERROR"
         try {
