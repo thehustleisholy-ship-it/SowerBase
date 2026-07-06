@@ -432,27 +432,36 @@ function Backup-PostgreSQL {
         Write-Log "Output: $backupFile" "DEBUG"
         Write-Log "Starting dump operation..." "INFO"
 
-        # Log active database sequences before dump
+        # Log active database schemas and sequences before dump
+        Write-Log "Capturing active database schemas..." "DEBUG"
+        $env:PGPASSWORD = $DbPassword
+        $activeSchemas = docker exec $DOCKER_CONTAINER_NAME psql -U $DB_USER -h localhost -d $DB_NAME -t -A -c "SELECT quote_ident(nspname) FROM pg_namespace WHERE nspname NOT IN ('pg_catalog', 'information_schema') AND nspname NOT LIKE 'pg_toast%' ORDER BY nspname;" 2>$null
+        [System.Environment]::SetEnvironmentVariable('PGPASSWORD', $null)
+
+        $activeSchemaList = @($activeSchemas -split "`n" | Where-Object { $_ -match '\S' } | ForEach-Object { $_.Trim() })
+        $nonPublicSchemaList = @($activeSchemaList | Where-Object { $_ -ne "public" })
+        Write-Log "Active non-system schemas: $($activeSchemaList.Count) found: $($activeSchemaList -join ', ')" "DEBUG"
+
         Write-Log "Capturing active database sequences..." "DEBUG"
         $env:PGPASSWORD = $DbPassword
-        $activeSequences = docker exec $DOCKER_CONTAINER_NAME psql -U $DB_USER -h localhost -d $DB_NAME -t -c "SELECT sequence_name FROM information_schema.sequences WHERE sequence_schema = 'public' ORDER BY sequence_name;" 2>$null
+        $activeSequences = docker exec $DOCKER_CONTAINER_NAME psql -U $DB_USER -h localhost -d $DB_NAME -t -A -c "SELECT quote_ident(sequence_schema) || '.' || quote_ident(sequence_name) FROM information_schema.sequences WHERE sequence_schema NOT IN ('pg_catalog', 'information_schema') AND sequence_schema NOT LIKE 'pg_toast%' ORDER BY 1;" 2>$null
         [System.Environment]::SetEnvironmentVariable('PGPASSWORD', $null)
 
         $activeSeqList = @($activeSequences -split "`n" | Where-Object { $_ -match '\S' } | ForEach-Object { $_.Trim() })
         Write-Log "Active sequences: $($activeSeqList.Count) found: $($activeSeqList -join ', ')" "DEBUG"
 
-        # Execute pg_dump via Docker with options for complete schema
+        # Execute pg_dump via Docker with options for the complete PostgreSQL database.
         $env:PGPASSWORD = $DbPassword
 
         # Create the backup file using docker exec - NO 2>&1 to avoid mixing verbose output with SQL
-        # Options: -F p (plain text), --schema public (explicit schema), --no-owner (compatible restore)
+        # Options: -F p (plain text), --no-owner (compatible restore)
+        # Do not pass --schema/-n here: NocoDB user-data tables live outside public.
         # DO NOT use --verbose to keep dump clean
         $dumpProcess = docker exec -i $DOCKER_CONTAINER_NAME pg_dump `
             -U $DB_USER `
             -h localhost `
             -F p `
             --no-owner `
-            --schema=public `
             $DB_NAME
 
         if ($LASTEXITCODE -eq 0) {
@@ -473,6 +482,14 @@ function Backup-PostgreSQL {
                     $missingObjects += "CREATE SEQUENCE"
                 }
 
+
+                # Check that every non-public NocoDB user-data schema is present.
+                foreach ($schemaName in $nonPublicSchemaList) {
+                    $schemaPattern = "CREATE SCHEMA\s+$([regex]::Escape($schemaName));"
+                    if ($dumpContent -notmatch $schemaPattern) {
+                        $missingObjects += "schema: $schemaName"
+                    }
+                }
                 # Check for specific required sequences
                 foreach ($seqName in $activeSeqList) {
                     if ($dumpContent -notmatch [regex]::Escape($seqName)) {
@@ -505,9 +522,11 @@ function Backup-PostgreSQL {
                 Write-Log "PostgreSQL backup completed successfully" "SUCCESS"
                 Write-Log "  File: $backupFile" "INFO"
                 Write-Log "  Size: $dumpSizeKB KB" "INFO"
+                Write-Log "  Schemas in scope: $($activeSchemaList.Count)" "INFO"
+                Write-Log "  User-data schemas in dump: $($nonPublicSchemaList.Count)" "INFO"
                 Write-Log "  Sequences in dump: $($activeSeqList.Count)" "INFO"
                 Write-Log "  Dump validation: PASSED" "SUCCESS"
-                Add-Content -Path $BACKUP_LOG -Value "[$(Get-Date)] POSTGRES_BACKUP_SUCCESS $backupFile ($dumpSizeKB KB) Sequences: $($activeSeqList.Count)"
+                Add-Content -Path $BACKUP_LOG -Value "[$(Get-Date)] POSTGRES_BACKUP_SUCCESS $backupFile ($dumpSizeKB KB) Schemas: $($activeSchemaList.Count) UserDataSchemas: $($nonPublicSchemaList.Count) Sequences: $($activeSeqList.Count)"
 
                 # Cleanup
                 Remove-Item -ErrorAction SilentlyContinue env:PGPASSWORD
