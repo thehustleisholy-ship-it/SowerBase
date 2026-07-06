@@ -144,6 +144,7 @@ Write-Step "Run ID: $runId"
 
 Import-EnvFile -Path $EnvFile
 [Environment]::SetEnvironmentVariable("ASKTHIH_WEBHOOK_PORT", [string]$Port, "Process")
+[Environment]::SetEnvironmentVariable("ASKTHIH_WEBHOOK_AUTH_MODE", "shared-secret", "Process")
 
 $requiredVars = @("ASKTHIH_WEBHOOK_SECRET", "SOWERBASE_BASE_URL", "SOWERBASE_API_TOKEN", "SOWERBASE_INTAKE_TABLE_ID")
 $missing = @($requiredVars | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })

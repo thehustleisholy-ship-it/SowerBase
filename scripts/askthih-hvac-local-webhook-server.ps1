@@ -95,6 +95,82 @@ function Find-SowerBaseRecordByChannel {
     return $null
 }
 
+
+function ConvertTo-Hex {
+    param([byte[]]$Bytes)
+    return -join ($Bytes | ForEach-Object { "{0:x2}" -f $_ })
+}
+
+function Test-FixedTimeHexEquals {
+    param(
+        [Parameter(Mandatory = $true)] [string]$ExpectedHex,
+        [Parameter(Mandatory = $true)] [string]$ActualHex
+    )
+
+    if ($ExpectedHex.Length -ne $ActualHex.Length) { return $false }
+
+    try {
+        $expectedBytes = [Convert]::FromHexString($ExpectedHex)
+        $actualBytes = [Convert]::FromHexString($ActualHex)
+        return [System.Security.Cryptography.CryptographicOperations]::FixedTimeEquals($expectedBytes, $actualBytes)
+    } catch {
+        return $false
+    }
+}
+
+function Test-WebhookSignature {
+    param(
+        [AllowEmptyString()] [string]$AuthorizationHeader,
+        [Parameter(Mandatory = $true)] [string]$Body,
+        [Parameter(Mandatory = $true)] [string]$Secret,
+        [Parameter(Mandatory = $true)] [int]$ToleranceSeconds,
+        [Parameter(Mandatory = $true)] [hashtable]$ReplayCache
+    )
+
+    if ([string]::IsNullOrWhiteSpace($AuthorizationHeader)) {
+        return [pscustomobject]@{ ok = $false; status = 401; reason = "missing_signature" }
+    }
+
+    $match = [regex]::Match($AuthorizationHeader, '^Signature\s+(\d{10,})\.([0-9a-fA-F]{64})$')
+    if (-not $match.Success) {
+        return [pscustomobject]@{ ok = $false; status = 401; reason = "malformed_signature" }
+    }
+
+    $timestamp = [int64]$match.Groups[1].Value
+    $providedSignature = $match.Groups[2].Value.ToLowerInvariant()
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+
+    if ([math]::Abs($now - $timestamp) -gt $ToleranceSeconds) {
+        return [pscustomobject]@{ ok = $false; status = 401; reason = "stale_timestamp" }
+    }
+
+    $signedPayload = "$timestamp.$Body"
+    $hmac = [System.Security.Cryptography.HMACSHA256]::new([System.Text.Encoding]::UTF8.GetBytes($Secret))
+    try {
+        $expectedSignature = ConvertTo-Hex -Bytes $hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($signedPayload))
+    } finally {
+        $hmac.Dispose()
+    }
+
+    if (-not (Test-FixedTimeHexEquals -ExpectedHex $expectedSignature -ActualHex $providedSignature)) {
+        return [pscustomobject]@{ ok = $false; status = 401; reason = "bad_signature" }
+    }
+
+    $replayKey = "$timestamp.$providedSignature"
+    if ($ReplayCache.ContainsKey($replayKey)) {
+        return [pscustomobject]@{ ok = $false; status = 409; reason = "replay_detected" }
+    }
+
+    $ReplayCache[$replayKey] = $now
+    foreach ($key in @($ReplayCache.Keys)) {
+        if (($now - [int64]$ReplayCache[$key]) -gt $ToleranceSeconds) {
+            $ReplayCache.Remove($key)
+        }
+    }
+
+    return [pscustomobject]@{ ok = $true; status = 200; reason = "signature_valid" }
+}
+
 Write-Log "AskTHIH HVAC Local Webhook Server Starting"
 Write-Log "Port: $Port"
 Write-Log "Endpoint: http://localhost:$Port/askthih/hvac"
@@ -123,6 +199,10 @@ foreach ($var in $requiredVars) {
 Write-Log "SowerBase API environment variables verified"
 Write-Log "SOWERBASE_BASE_URL configured (token redacted)" "DEBUG"
 $webhookSecret = $env:ASKTHIH_WEBHOOK_SECRET
+$authMode = if ($env:ASKTHIH_WEBHOOK_AUTH_MODE) { $env:ASKTHIH_WEBHOOK_AUTH_MODE } else { "signature" }
+$signatureToleranceSeconds = if ($env:ASKTHIH_WEBHOOK_SIGNATURE_TOLERANCE_SECONDS) { [int]$env:ASKTHIH_WEBHOOK_SIGNATURE_TOLERANCE_SECONDS } else { 300 }
+$signatureReplayCache = @{}
+Write-Log "Webhook auth mode: $authMode" "DEBUG"
 
 # ============================================================================
 # HTTP Listener Setup
@@ -251,15 +331,6 @@ while (-not $shutdown) {
             continue
         }
 
-        $providedSecret = $request.Headers["X-AskTHIH-Webhook-Secret"]
-        if ([string]::IsNullOrWhiteSpace($providedSecret) -or -not [System.String]::Equals($providedSecret, $webhookSecret, [System.StringComparison]::Ordinal)) {
-            Write-Log "Rejected unauthorized webhook request" "WARN"
-            Send-JsonResponse -Response $response -StatusCode 401 -Body @{
-                status = "error"
-                message = "Unauthorized"
-            }
-            continue
-        }
         # Read request body safely
         $body = ""
         try {
@@ -282,6 +353,34 @@ while (-not $shutdown) {
         }
 
         Write-Log "Request body length: $($body.Length) bytes" "DEBUG"
+
+        if ($authMode -eq "shared-secret") {
+            $providedSecret = $request.Headers["X-AskTHIH-Webhook-Secret"]
+            if ([string]::IsNullOrWhiteSpace($providedSecret) -or -not [System.String]::Equals($providedSecret, $webhookSecret, [System.StringComparison]::Ordinal)) {
+                Write-Log "Rejected unauthorized webhook request" "WARN"
+                Send-JsonResponse -Response $response -StatusCode 401 -Body @{
+                    status = "error"
+                    message = "Unauthorized"
+                }
+                continue
+            }
+        } else {
+            $signatureResult = Test-WebhookSignature `
+                -AuthorizationHeader $request.Headers["Authorization"] `
+                -Body $body `
+                -Secret $webhookSecret `
+                -ToleranceSeconds $signatureToleranceSeconds `
+                -ReplayCache $signatureReplayCache
+
+            if (-not $signatureResult.ok) {
+                Write-Log "Rejected signed webhook request: $($signatureResult.reason)" "WARN"
+                Send-JsonResponse -Response $response -StatusCode $signatureResult.status -Body @{
+                    status = "error"
+                    message = $(if ($signatureResult.status -eq 409) { "Replay detected" } else { "Unauthorized" })
+                }
+                continue
+            }
+        }
 
         # Parse JSON
         $payload = $null
