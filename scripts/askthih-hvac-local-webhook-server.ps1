@@ -342,6 +342,13 @@ while (-not $shutdown) {
             "Urgency" = $payload.urgency
             "Channel" = $payload.channel
             "Status" = $payload.status
+            "Trace ID" = $(if ($payload.trace_id) { $payload.trace_id } else { "" })
+            "Submitted At" = $(if ($payload.submitted_at) { $payload.submitted_at } else { (Get-Date -AsUTC).ToString("o") })
+            "Transcript" = $(if ($payload.transcript) { $payload.transcript } else { "" })
+            "System Type" = $(if ($payload.system_type) { $payload.system_type } else { "" })
+            "System Age" = $(if ($payload.system_age_years) { $payload.system_age_years } else { "" })
+            "Preferred Service Window" = $(if ($payload.preferred_service_window) { $payload.preferred_service_window } else { "" })
+            "Preferred Callback Time" = $(if ($payload.preferred_callback_time) { $payload.preferred_callback_time } else { "" })
             "Source System" = $(if ($payload.source_system) { $payload.source_system } else { "askthih_webhook_api" })
             "Source Base ID" = "app60wQWdbbgyqTcL"
             "Source Table Name" = $(if ($payload.source_table_name) { $payload.source_table_name } else { "HVAC Intake" })
